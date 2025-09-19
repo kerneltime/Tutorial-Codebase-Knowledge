@@ -1,10 +1,12 @@
 import os
 import re
 import yaml
+import time
 from pocketflow import Node, BatchNode
 from utils.crawl_github_files import crawl_github_files
 from utils.call_llm import call_llm
 from utils.crawl_local_files import crawl_local_files
+from utils.token_counter import chunk_files_by_tokens
 
 
 # Helper to get content for specific file indices
@@ -81,77 +83,78 @@ class FetchRepo(Node):
         shared["files"] = exec_res  # List of (path, content) tuples
 
 
-class IdentifyAbstractions(Node):
+class IdentifyAbstractions(BatchNode):
     def prep(self, shared):
         files_data = shared["files"]
-        project_name = shared["project_name"]  # Get project name
-        language = shared.get("language", "english")  # Get language
-        use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
-        max_abstraction_num = shared.get("max_abstraction_num", 10)  # Get max_abstraction_num, default to 10
+        project_name = shared["project_name"]
+        language = shared.get("language", "english")
+        use_cache = shared.get("use_cache", True)
+        max_abstraction_num = shared.get("max_abstraction_num", 10)
 
-        # Helper to create context from files, respecting limits (basic example)
-        def create_llm_context(files_data):
-            context = ""
-            file_info = []  # Store tuples of (index, path)
-            for i, (path, content) in enumerate(files_data):
-                entry = f"--- File Index {i}: {path} ---\n{content}\n\n"
-                context += entry
-                file_info.append((i, path))
+        # Store metadata for later use in exec/post
+        self.project_name = project_name
+        self.language = language
+        self.use_cache = use_cache
+        self.max_abstraction_num = max_abstraction_num
+        self.original_files = files_data  # Keep reference to original files
 
-            return context, file_info  # file_info is list of (index, path)
+        # Chunk files by token limit to avoid 1M token quota
+        file_chunks = chunk_files_by_tokens(files_data, max_tokens=800000)
+        print(f"Split {len(files_data)} files into {len(file_chunks)} chunks")
 
-        context, file_info = create_llm_context(files_data)
-        # Format file info for the prompt (comment is just a hint for LLM)
-        file_listing_for_prompt = "\n".join(
-            [f"- {idx} # {path}" for idx, path in file_info]
-        )
-        return (
-            context,
-            file_listing_for_prompt,
-            len(files_data),
-            project_name,
-            language,
-            use_cache,
-            max_abstraction_num,
-        )  # Return all parameters
+        return file_chunks  # Return list of chunks for batch processing
 
-    def exec(self, prep_res):
-        (
-            context,
-            file_listing_for_prompt,
-            file_count,
-            project_name,
-            language,
-            use_cache,
-            max_abstraction_num,
-        ) = prep_res  # Unpack all parameters
-        print(f"Identifying abstractions using LLM...")
+    def exec(self, chunk):
+        """Process a single chunk of files to identify abstractions."""
+        print(f"Processing chunk with {len(chunk)} files...")
 
-        # Add language instruction and hints only if not English
+        # Create context from this chunk
+        context = ""
+        file_info = []
+        chunk_start_idx = 0
+
+        # Find the starting index of this chunk in the original files
+        for i, (orig_path, _) in enumerate(self.original_files):
+            if chunk[0][0] == orig_path:  # Match first file in chunk
+                chunk_start_idx = i
+                break
+
+        # Build context and file info for this chunk
+        for local_i, (path, content) in enumerate(chunk):
+            global_idx = chunk_start_idx + local_i
+            entry = f"--- File Index {global_idx}: {path} ---\n{content}\n\n"
+            context += entry
+            file_info.append((global_idx, path))
+
+        file_listing_for_prompt = "\n".join([f"- {idx} # {path}" for idx, path in file_info])
+
+        # Language setup
         language_instruction = ""
         name_lang_hint = ""
         desc_lang_hint = ""
-        if language.lower() != "english":
-            language_instruction = f"IMPORTANT: Generate the `name` and `description` for each abstraction in **{language.capitalize()}** language. Do NOT use English for these fields.\n\n"
-            # Keep specific hints here as name/description are primary targets
-            name_lang_hint = f" (value in {language.capitalize()})"
-            desc_lang_hint = f" (value in {language.capitalize()})"
+        if self.language.lower() != "english":
+            language_instruction = f"IMPORTANT: Generate the `name` and `description` for each abstraction in **{self.language.capitalize()}** language. Do NOT use English for these fields.\n\n"
+            name_lang_hint = f" (value in {self.language.capitalize()})"
+            desc_lang_hint = f" (value in {self.language.capitalize()})"
+
+        # Reduce max abstractions per chunk to avoid overwhelming the LLM
+        max_per_chunk = min(5, self.max_abstraction_num)
 
         prompt = f"""
-For the project `{project_name}`:
+For the project `{self.project_name}` (analyzing part of codebase):
 
 Codebase Context:
 {context}
 
-{language_instruction}Analyze the codebase context.
-Identify the top 5-{max_abstraction_num} core most important abstractions to help those new to the codebase.
+{language_instruction}Analyze this portion of the codebase.
+Identify up to {max_per_chunk} important abstractions/concepts from THIS SPECIFIC CODE PORTION.
 
 For each abstraction, provide:
 1. A concise `name`{name_lang_hint}.
 2. A beginner-friendly `description` explaining what it is with a simple analogy, in around 100 words{desc_lang_hint}.
 3. A list of relevant `file_indices` (integers) using the format `idx # path/comment`.
 
-List of file indices and paths present in the context:
+List of file indices and paths present in this context:
 {file_listing_for_prompt}
 
 Format the output as a YAML list of dictionaries:
@@ -163,39 +166,34 @@ Format the output as a YAML list of dictionaries:
     Explains what the abstraction does.
     It's like a central dispatcher routing requests.{desc_lang_hint}
   file_indices:
-    - 0 # path/to/file1.py
-    - 3 # path/to/related.py
-- name: |
-    Query Optimization{name_lang_hint}
-  description: |
-    Another core concept, similar to a blueprint for objects.{desc_lang_hint}
-  file_indices:
-    - 5 # path/to/another.js
-# ... up to {max_abstraction_num} abstractions
+    - {chunk_start_idx} # path/to/file1.py
+# ... up to {max_per_chunk} abstractions
 ```"""
-        response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))  # Use cache only if enabled and not retrying
 
-        # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
-        abstractions = yaml.safe_load(yaml_str)
+        response = call_llm(prompt, use_cache=(self.use_cache and self.cur_retry == 0))
+
+        # Small delay between chunks to reduce API rate
+        time.sleep(1)
+
+        # Validation
+        try:
+            yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+            abstractions = yaml.safe_load(yaml_str)
+        except:
+            print(f"Warning: Failed to parse YAML from chunk response, returning empty list")
+            return []
 
         if not isinstance(abstractions, list):
-            raise ValueError("LLM Output is not a list")
+            print(f"Warning: LLM output not a list for chunk, returning empty list")
+            return []
 
         validated_abstractions = []
-        for item in abstractions:
-            if not isinstance(item, dict) or not all(
-                k in item for k in ["name", "description", "file_indices"]
-            ):
-                raise ValueError(f"Missing keys in abstraction item: {item}")
-            if not isinstance(item["name"], str):
-                raise ValueError(f"Name is not a string in item: {item}")
-            if not isinstance(item["description"], str):
-                raise ValueError(f"Description is not a string in item: {item}")
-            if not isinstance(item["file_indices"], list):
-                raise ValueError(f"file_indices is not a list in item: {item}")
+        valid_indices = set(idx for idx, _ in file_info)
 
-            # Validate indices
+        for item in abstractions:
+            if not isinstance(item, dict) or not all(k in item for k in ["name", "description", "file_indices"]):
+                continue
+
             validated_indices = []
             for idx_entry in item["file_indices"]:
                 try:
@@ -206,35 +204,48 @@ Format the output as a YAML list of dictionaries:
                     else:
                         idx = int(str(idx_entry).strip())
 
-                    if not (0 <= idx < file_count):
-                        raise ValueError(
-                            f"Invalid file index {idx} found in item {item['name']}. Max index is {file_count - 1}."
-                        )
-                    validated_indices.append(idx)
+                    if idx in valid_indices:
+                        validated_indices.append(idx)
                 except (ValueError, TypeError):
-                    raise ValueError(
-                        f"Could not parse index from entry: {idx_entry} in item {item['name']}"
-                    )
+                    continue
 
-            item["files"] = sorted(list(set(validated_indices)))
-            # Store only the required fields
-            validated_abstractions.append(
-                {
-                    "name": item["name"],  # Potentially translated name
-                    "description": item[
-                        "description"
-                    ],  # Potentially translated description
-                    "files": item["files"],
-                }
-            )
+            if validated_indices:  # Only keep if has valid file indices
+                validated_abstractions.append({
+                    "name": item["name"],
+                    "description": item["description"],
+                    "files": sorted(list(set(validated_indices)))
+                })
 
-        print(f"Identified {len(validated_abstractions)} abstractions.")
+        print(f"Identified {len(validated_abstractions)} abstractions from chunk.")
         return validated_abstractions
 
-    def post(self, shared, prep_res, exec_res):
-        shared["abstractions"] = (
-            exec_res  # List of {"name": str, "description": str, "files": [int]}
-        )
+    def post(self, shared, prep_res, exec_res_list):
+        """Combine abstractions from all chunks."""
+        # exec_res_list is a list of lists of abstractions
+        all_abstractions = []
+        for chunk_abstractions in exec_res_list:
+            all_abstractions.extend(chunk_abstractions)
+
+        # Remove duplicates based on name similarity and merge similar ones
+        unique_abstractions = []
+        for abstraction in all_abstractions:
+            # Simple deduplication based on exact name match
+            is_duplicate = False
+            for existing in unique_abstractions:
+                if abstraction["name"].strip().lower() == existing["name"].strip().lower():
+                    # Merge file indices if duplicate name found
+                    existing["files"] = sorted(list(set(existing["files"] + abstraction["files"])))
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                unique_abstractions.append(abstraction)
+
+        # Limit to max_abstraction_num
+        final_abstractions = unique_abstractions[:self.max_abstraction_num]
+
+        print(f"Combined {len(all_abstractions)} abstractions from chunks into {len(final_abstractions)} unique abstractions.")
+        shared["abstractions"] = final_abstractions
 
 
 class AnalyzeRelationships(Node):

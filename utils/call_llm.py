@@ -2,6 +2,7 @@ from google import genai
 import os
 import logging
 import json
+import time
 from datetime import datetime
 
 # Configure logging
@@ -46,23 +47,47 @@ def call_llm(prompt: str, use_cache: bool = True) -> str:
             logger.info(f"RESPONSE: {cache[prompt]}")
             return cache[prompt]
 
-    # # Call the LLM if not in cache or cache disabled
-    # client = genai.Client(
-    #     vertexai=True,
-    #     # TODO: change to your own project id and location
-    #     project=os.getenv("GEMINI_PROJECT_ID", "your-project-id"),
-    #     location=os.getenv("GEMINI_LOCATION", "us-central1")
-    # )
-
-    # You can comment the previous line and use the AI Studio key instead:
+    # Call the LLM with retry logic for rate limits
     client = genai.Client(
         api_key=os.getenv("GEMINI_API_KEY", ""),
     )
+    #model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-    # model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    
-    response = client.models.generate_content(model=model, contents=[prompt])
-    response_text = response.text
+
+    max_retries = 5
+    base_delay = 2.0
+
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(model=model, contents=[prompt])
+            response_text = response.text
+            break
+        except Exception as e:
+            error_str = str(e)
+
+            # Check if it's a 429 rate limit error
+            if "429" in error_str and "RESOURCE_EXHAUSTED" in error_str:
+                # Extract retry delay from error message if available
+                retry_delay = base_delay * (2 ** attempt)  # Exponential backoff
+
+                # Try to parse the suggested delay from the error
+                import re
+                delay_match = re.search(r'retry in (\d+\.?\d*)s', error_str)
+                if delay_match:
+                    suggested_delay = float(delay_match.group(1))
+                    retry_delay = max(retry_delay, suggested_delay)
+
+                if attempt < max_retries - 1:
+                    logger.warning(f"Rate limit hit (attempt {attempt + 1}/{max_retries}). Waiting {retry_delay:.1f}s before retry...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error(f"Max retries exceeded for rate limit. Final error: {error_str}")
+                    raise e
+            else:
+                # Non-rate-limit error, don't retry
+                logger.error(f"LLM API error: {error_str}")
+                raise e
 
     # Log the response
     logger.info(f"RESPONSE: {response_text}")
